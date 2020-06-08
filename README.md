@@ -1,9 +1,15 @@
-# kraken2_confidence_recal
-A post-processing tool to reclassify [Kraken 2] output based on the confidence score and/or minimizer hit groups.
+# StringMeUp
 
-# Usage
+A post-processing tool to reclassify [Kraken 2] output based on the confidence score and/or minimum minimizer hit groups.
 
-A good start is to run `kraken2_confidence_recal --help`.
+## Installation
+StringMeUP is available to install through conda. Simply run the following command to install it:
+
+`conda install -c conda-forge -c bioconda stringmeup`
+
+## Usage
+
+A good start is to run `stringmeup --help`.
 
 ## About the confidence score
 
@@ -17,7 +23,7 @@ If the CS for a given read _R_ at a given node _J_ is equal to or larger than th
 
 To reclassify reads classified by Kraken 2 with a confidence cutoff of 0.1:
 
-`kraken2_confidence_recal --names <names.dmp> --nodes <nodes.dmp> 0.1 <original_classifications.kraken2>`
+`stringmeup --names <names.dmp> --nodes <nodes.dmp> 0.1 <original_classifications.kraken2>`
 
 Where:
 * original_classifications.kraken2 is the output file from Kraken 2 that contain the read-by-read classifications.

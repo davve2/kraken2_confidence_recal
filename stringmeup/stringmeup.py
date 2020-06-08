@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 
+__version__ = "0.1.1"
+
 import argparse
-import taxonomy
+import stringmeup.taxonomy
 import operator
 import logging
+import gzip
 import sys
 from dataclasses import dataclass
 from os import path
@@ -14,71 +17,9 @@ logging.basicConfig(
     datefmt='%Y-%m-%d [%H:%M:%S]')
 log = logging.getLogger(path.basename(__file__))
 
-# TODO: supply more than one confidence threshold at the same time: $ python confidence_threshold.py 0.01 0.1 0.15 /path/to/file
 # TODO: make sure confidence_threshold is between 0 and 1
-# TODO: be able to reclassify 'U' reads (when using input that was created by kraken2 with confidence applied). Should be easy (just skip the "if startswith 'C'" in the main loop?)`.`
-# TODO: all log output should go to stderr so people can send stdout to file (for example when printing a report but not having supplied an output file destination for it)
 # TODO: For the verbose output, also output (1) the number of kmers that hit in total, (2) the number of non-ambiguous kmers (queried).
 
-# Arguments
-parser = argparse.ArgumentParser(
-    prog='Confidence score reclassification',
-    usage='confidence_recal [--names <FILE> --nodes <FILE> | --taxonomy_file <FILE>] [--output_report <FILE>] [--output_classifications <FILE>] [--output_verbose <FILE>] [--keep_unclassified] [--help] confidence classifications',
-    description='Reclassification of reads (Kraken 2) by confidence score.')
-parser.add_argument(
-    'confidence_threshold',
-    metavar='confidence',
-    type=float,
-    help='The confidence score threshold to be used in reclassification [0-1].')
-parser.add_argument(
-    'original_classifications_file',
-    metavar='classifications',
-    type=str,
-    help='Path to the Kraken 2 output file containing the individual read classifications.')
-parser.add_argument(
-    '--output_report',
-    metavar='FILE',
-    type=str,
-    help='File to save the Kraken 2 report in.')
-parser.add_argument(
-    '--output_classifications',
-    metavar='FILE',
-    type=str,
-    help='File to save the Kraken 2 read classifications in.')
-parser.add_argument(
-    '--keep_unclassified',
-    action='store_true',
-    help='Specify if you want to output unclassified reads in addition to classified reads. NOTE(!): This script will always discard reads that are unclassified in the classifications input file, this flag will just make sure to keep previously classified reads even if they are reclassified as unclassified by this script. TIP(!): Always run Kraken2 with no confidence cutoff.')
-parser.add_argument(
-    '--output_verbose',
-    metavar='FILE',
-    type=str,
-    help='File to send verbose output to. This file will contain, for each read, (1) original classification, (2) new classification, (3) original confidence, (4), new confidence (5), original taxa name (6), new taxa name, (7) original rank, (8) new rank, (9) distance travelled (how many nodes was it lifted upwards in the taxonomy).')
-group = parser.add_mutually_exclusive_group(required=True)
-group.add_argument(
-    '--names',
-    metavar='FILE',
-    help='taxonomy names dump file (names.dmp)')
-group.add_argument(
-    '--taxonomy_file',
-    metavar='FILE',
-    help='Path to a pickle file containing a taxonomy tree created through the TaxonomyTree.save_taxonomy function (taxonomy.py).')
-parser.add_argument(
-    '--nodes',
-    metavar='FILE',
-    help='taxonomy nodes dump file (nodes.dmp)')
-parser.add_argument(
-    '--minimum_hit_groups',
-    metavar='INT',
-    type=int,
-    help='The minimum number of hit groups a read needs to be classified. NOTE: You need to supply a classifications file (kraken2 output) that contain the "minimizer_hit_groups" column.')
-args = parser.parse_args()
-
-if args.names and args.nodes is None:
-    parser.error("--names requires --nodes to be set as well.")
-
-taxa_lineages = {}
-report_frequency = 10000000  # Will output progress every nth read
 
 @dataclass
 class ReadClassification:
@@ -112,7 +53,7 @@ class ReportNode:
     offset: int
 
 
-def validate_input_file(putative_classifications_file, verbose_input):
+def validate_input_file(putative_classifications_file, verbose_input, minimum_hit_groups):
     """
     Perform simple validation of the input file.
     """
@@ -123,7 +64,7 @@ def validate_input_file(putative_classifications_file, verbose_input):
             file=putative_classifications_file))
         sys.exit()
 
-    with open(putative_classifications_file, 'r') as f:
+    with read_file(putative_classifications_file) as f:
         line = f.readline()
         line_proc = line.strip()
         line_proc = line_proc.split('\t')
@@ -133,12 +74,12 @@ def validate_input_file(putative_classifications_file, verbose_input):
         # TODO: This can be done much better.
         if not verbose_input:
             num_cols = len(line_proc) == 5  # original type of kraken2 output file
-            if args.minimum_hit_groups:
+            if minimum_hit_groups:
                 log.error('You specified --minimum_hit_groups {}, but didn\'t supply an input file that contain a minimizer hit groups column.')
                 sys.exit()
         else:
             num_cols = len(line_proc) == 6  # 6 columns if the output was produced with the verbose version of kraken2 that outputs minimizer_groups
-            if not args.minimum_hit_groups:
+            if not minimum_hit_groups:
                 log.error('The input file contains too many columns. Use --minimum_hit_groups if you want to use an input file that contain a minimizer hit groups column.')
                 sys.exit()
 
@@ -164,7 +105,7 @@ def is_verbose_input(classifications_file):
     Returns true if input file consists of 6 columns instead of 5.
     """
 
-    with open(classifications_file, 'r') as f:
+    with read_file(classifications_file) as f:
         line = f.readline()
         line_proc = line.strip()
         line_proc = line_proc.split('\t')
@@ -207,7 +148,7 @@ def process_kmer_string(kmer_info_string):
     return taxa_kmer_dict
 
 
-def reclassify_read(read, confidence_threshold, taxonomy_tree, verbose_input):
+def reclassify_read(read, confidence_threshold, taxonomy_tree, verbose_input, minimum_hit_groups, taxa_lineages):
     """
     Sums the number of kmers that hit in the clade rooted at "current_node",
     and divides it with the total number of kmers queried against the database:
@@ -250,7 +191,7 @@ def reclassify_read(read, confidence_threshold, taxonomy_tree, verbose_input):
 
     # Filter minimizer_hit_groups
     if verbose_input:
-        if read.minimizer_hit_groups < args.minimum_hit_groups:
+        if read.minimizer_hit_groups < minimum_hit_groups:
             doomed_to_fail = True
 
     # The nr of kmers that hit within the clade rooted at the current node:
@@ -309,20 +250,20 @@ def reclassify_read(read, confidence_threshold, taxonomy_tree, verbose_input):
             if doomed_to_fail:
                 read.recalculated_conf = max_confidence
                 read.reclassified_taxid = 0
-                return read
+                return read, taxa_lineages
 
         # If the confidence at this node is sufficient, we classify it to
         # the current node (TaxID).
         if read.recalculated_conf >= confidence_threshold:
             read.classified = True
             read.reclassified_taxid = read.current_node
-            return read
+            return read, taxa_lineages
 
         # If the current node is the root, we stop (can't go higher up in the
         # taxonomy).
         elif read.current_node == 1:
             read.reclassified_taxid = 0
-            return read
+            return read, taxa_lineages
 
         # Otherwise, set the current_node to the parent and keep going.
         else:
@@ -511,7 +452,7 @@ def format_kraken2_report_row(report_node):
     return report_row
 
 
-def make_kraken2_report(tax_reads, taxonomy_tree, total_reads):
+def make_kraken2_report(tax_reads, taxonomy_tree, total_reads, output_report):
     """
     Gets the information that should be printed from
     get_kraken2_report_content. Formats the information and prints it to file
@@ -524,15 +465,15 @@ def make_kraken2_report(tax_reads, taxonomy_tree, total_reads):
         tax_reads, taxonomy_tree, total_reads)
 
     # If the output should go to file
-    if args.output_report:
-        with open(args.output_report, 'w') as f:
+    if output_report:
+        with open(output_report, 'w') as f:
             for node in report_node_list:
 
                 # Format the output
                 report_row = format_kraken2_report_row(node)
                 f.write(report_row + '\n')
 
-            log.info('Report saved in {}.'.format(args.output_report))
+            log.info('Report saved in {}.'.format(output_report))
 
     # Otherwise, print to stdout
     else:
@@ -607,7 +548,7 @@ def create_read(kraken2_read, verbose_input=False):
     return read
 
 
-def main_loop(f_handle, tax_reads_dict, taxonomy_tree, verbose_input=False, o_handle=None, v_handle=None):
+def main_loop(f_handle, tax_reads_dict, taxonomy_tree, args, report_frequency, taxa_lineages, verbose_input=False, o_handle=None, v_handle=None):
     """
     f_handle: classifications input file to read from.
     o_handle: output_classifications file to write to.
@@ -627,7 +568,7 @@ def main_loop(f_handle, tax_reads_dict, taxonomy_tree, verbose_input=False, o_ha
             row_items.insert(4, read.minimizer_hit_groups)
 
         row_string = '\t'.join([str(x) for x in row_items]) + '\n'
-        o.write(row_string)
+        _ = o_handle.write(row_string)  # gzip write fnc returns output, therefore send to "_"
 
     def write_verbose_output(read):
         # read is an instance of ReadClassification
@@ -650,7 +591,7 @@ def main_loop(f_handle, tax_reads_dict, taxonomy_tree, verbose_input=False, o_ha
             row_items.insert(2, read.minimizer_hit_groups)
 
         row_string = '\t'.join([str(x) for x in row_items]) + '\n'
-        v.write(row_string)
+        _ = v_handle.write(row_string)  # gzip write fnc returns output, therefore send to "_"
 
     # Parse the input file, read per read
     i = 0
@@ -664,11 +605,13 @@ def main_loop(f_handle, tax_reads_dict, taxonomy_tree, verbose_input=False, o_ha
             read = create_read(read_pair, verbose_input)
 
             # Reclassify the read pair based on confidence
-            read = reclassify_read(
+            read, taxa_lineages = reclassify_read(
                 read,
                 args.confidence_threshold,
                 taxonomy_tree,
-                verbose_input)
+                verbose_input,
+                args.minimum_hit_groups,
+                taxa_lineages)
 
             # Counter for number of reads per taxon/node
             if read.reclassified_taxid in tax_reads_dict['hits_at_node']:
@@ -699,19 +642,119 @@ def main_loop(f_handle, tax_reads_dict, taxonomy_tree, verbose_input=False, o_ha
     log.info('Done processing reads. They were {} in total.'.format(i))
 
     # Output a report file
-    make_kraken2_report(tax_reads_dict, taxonomy_tree, i)  # i is used to calculate the ratio of classified reads (col 1 in output file).
+    make_kraken2_report(tax_reads_dict, taxonomy_tree, i, args.output_report)  # i is used to calculate the ratio of classified reads (col 1 in output file).
 
 
-if __name__ == '__main__':
+def read_file(filename):
+    """
+    Wrapper to read either gzipped or ordinary text file input.
+    """
+    if filename.endswith('.gz'):
+        return gzip.open(filename, 'rt')
+    else:
+        return open(filename, 'r')
+
+
+def write_file(filename, gz_output):
+    """
+    Wrapper to write either gzipped or ordinary text file output.
+    """
+    if gz_output:
+        return gzip.open(filename, 'wt')
+    else:
+        return open(filename, 'w')
+
+
+def get_arguments():
+    """
+    Wrapper fnc to get the command line arguments. Inserting this piece of code
+    into its own fnc for conda compatibility.
+    """
+
+    parser = argparse.ArgumentParser(
+        prog='Confidence score reclassification',
+        usage='confidence_recal [--names <FILE> --nodes <FILE> | --taxonomy_file <FILE>] [--output_report <FILE>] [--output_classifications <FILE>] [--output_verbose <FILE>] [--keep_unclassified] [--minimum_hit_groups INT] [--gz_output] [--help] confidence classifications',
+        description='Reclassification of reads (Kraken 2) by confidence score.')
+    parser.add_argument(
+        'confidence_threshold',
+        metavar='confidence',
+        type=float,
+        help='The confidence score threshold to be used in reclassification [0-1].')
+    parser.add_argument(
+        'original_classifications_file',
+        metavar='classifications',
+        type=str,
+        help='Path to the Kraken 2 output file containing the individual read classifications.')
+    parser.add_argument(
+        '--output_report',
+        metavar='FILE',
+        type=str,
+        help='File to save the Kraken 2 report in.')
+    parser.add_argument(
+        '--output_classifications',
+        metavar='FILE',
+        type=str,
+        help='File to save the Kraken 2 read classifications in.')
+    parser.add_argument(
+        '--keep_unclassified',
+        action='store_true',
+        help='Specify if you want to output unclassified reads in addition to classified reads. NOTE(!): This script will always discard reads that are unclassified in the classifications input file, this flag will just make sure to keep previously classified reads even if they are reclassified as unclassified by this script. TIP(!): Always run Kraken2 with no confidence cutoff.')
+    parser.add_argument(
+        '--output_verbose',
+        metavar='FILE',
+        type=str,
+        help='File to send verbose output to. This file will contain, for each read, (1) original classification, (2) new classification, (3) original confidence, (4), new confidence (5), original taxa name (6), new taxa name, (7) original rank, (8) new rank, (9) distance travelled (how many nodes was it lifted upwards in the taxonomy).')
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument(
+        '--names',
+        metavar='FILE',
+        help='taxonomy names dump file (names.dmp)')
+    group.add_argument(
+        '--taxonomy_file',
+        metavar='FILE',
+        help='Path to a pickle file containing a taxonomy tree created through the TaxonomyTree.save_taxonomy function (taxonomy.py).')
+    parser.add_argument(
+        '--nodes',
+        metavar='FILE',
+        help='taxonomy nodes dump file (nodes.dmp)')
+    parser.add_argument(
+        '--minimum_hit_groups',
+        metavar='INT',
+        type=int,
+        help='The minimum number of hit groups a read needs to be classified. NOTE: You need to supply a classifications file (kraken2 output) that contain the "minimizer_hit_groups" column.')
+    parser.add_argument(
+        '--gz_output',
+        action='store_true',
+        help='Set this flag to output <output_classifications> and <output_verbose> in gzipped format (will add .gz extension to the filenames).'
+    )
+    args = parser.parse_args()
+
+    return args
+
+
+def stringmeup():
+
+    # Get the CL arguments
+    args = get_arguments()
+
+    if args.names and args.nodes is None:
+        parser.error("--names requires --nodes to be set as well.")
+
+    # Some initial setup
+    taxa_lineages = {}
+    report_frequency = 10000000  # Will output progress every nth read
+    tax_reads_dict = {'hits_at_node': {}, 'hits_at_clade': {}}
+
+    # Was the input generated with https://github.com/danisven/kraken2 ?
     verbose_input = is_verbose_input(args.original_classifications_file)
     if verbose_input:
         log.info("The input file appears to contain minimizer_hit_groups.")
-    validate_input_file(args.original_classifications_file, verbose_input)
 
-    tax_reads_dict = {'hits_at_node': {}, 'hits_at_clade': {}}
+    # Perform a naive check of the input file
+    validate_input_file(args.original_classifications_file, verbose_input, args.minimum_hit_groups)
 
-    # TODO: make sure output_report and output_classifications are writable files.
-
+    # If user provided names.dmp and nodes.dmp, create taxonomy tree from that,
+    # otherwise, create i from a pickled taxonomy file
     if args.names:
         taxonomy_tree = taxonomy.TaxonomyTree(names_filename=args.names, nodes_filename=args.nodes)
     else:
@@ -722,24 +765,35 @@ if __name__ == '__main__':
     v = None
 
     # Open the classifications input file:
-    with open(args.original_classifications_file, 'r') as f:
+    with read_file(args.original_classifications_file) as f:
         log.info('Processing read classifications from "{file}".'.format(file=path.abspath(args.original_classifications_file)))
 
+        # TODO: make sure output files are writable
         # If user wants to save the read classifications to file, open file
         if args.output_classifications:
+            if args.gz_output:
+                if not args.output_classifications.endswith('.gz'):
+                    args.output_classifications += '.gz'
             log.info('Saving reclassified reads in {}.'.format(args.output_classifications))
-            o = open(args.output_classifications, 'w')
+            o = write_file(args.output_classifications, args.gz_output)
 
         # If user wants to save the verbose classification output to file, open file
         if args.output_verbose:
+            if args.gz_output:
+                if not args.output_verbose.endswith('.gz'):
+                    args.output_verbose += '.gz'
             log.info('Saving verbose classification information in {}.'.format(args.output_verbose))
-            v = open(args.output_verbose, 'w')
+            v = write_file(args.output_verbose, args.gz_output)
 
         # Run the main loop (reclassification)
-        main_loop(f, tax_reads_dict, taxonomy_tree, verbose_input, o, v)
+        main_loop(f, tax_reads_dict, taxonomy_tree, args, report_frequency, taxa_lineages, verbose_input, o, v)
 
     # Remember to close files
     if o:
         o.close()
     if v:
         v.close()
+
+
+if __name__ == '__main__':
+    stringmeup()
