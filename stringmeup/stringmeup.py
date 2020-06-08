@@ -52,6 +52,15 @@ class ReportNode:
     name: str
     offset: int
 
+def zopen(path,*args, **kwargs):
+    '''Redefine open to handle zipped files automatically'''
+    if path.endswith(".gz"):
+        if str(*args) in ["r","w"] and sys.version_info.major >= 3:
+            ## Python version three and above interprets binary formats as binary, add t (rt) to get text returned
+            args = (str(*args)+"t",)
+        return gzip.open(path,*args,**kwargs)
+    else:
+        return open(path,*args,**kwargs)
 
 def validate_input_file(putative_classifications_file, verbose_input, minimum_hit_groups):
     """
@@ -64,7 +73,7 @@ def validate_input_file(putative_classifications_file, verbose_input, minimum_hi
             file=putative_classifications_file))
         sys.exit()
 
-    with read_file(putative_classifications_file) as f:
+    with zopen(putative_classifications_file) as f:
         line = f.readline()
         line_proc = line.strip()
         line_proc = line_proc.split('\t')
@@ -105,7 +114,7 @@ def is_verbose_input(classifications_file):
     Returns true if input file consists of 6 columns instead of 5.
     """
 
-    with read_file(classifications_file) as f:
+    with zopen(classifications_file) as f:
         line = f.readline()
         line_proc = line.strip()
         line_proc = line_proc.split('\t')
@@ -269,31 +278,6 @@ def reclassify_read(read, confidence_threshold, taxonomy_tree, verbose_input, mi
         else:
             read.current_node = taxonomy_tree.get_parent(
                 [read.current_node])[read.current_node]
-
-
-def read_kraken_output():
-    """
-    This should work to read classifications from a kraken 2 output file. It's
-    not complete, but the backbone is there. The point is, we should not have
-    to run reclassification in order to produce a report file - we shuold be
-    able to just read an output file and work with the classifications as they
-    are. Could also just modify the main loop.
-    """
-    tax_dict = {'hits_at_node': {}, 'hits_at_clade': {}}
-    i = 0
-    with open('Ki-1974-23-291.kraken2', 'r') as f:
-        for line in f:
-            if line.startswith('C'):
-                l = line.strip().split('\t')
-                tax_id = int(l[2])
-                if tax_id not in tax_dict['hits_at_node']:
-                    tax_dict['hits_at_node'][tax_id] = 1
-                else:
-                    tax_dict['hits_at_node'][tax_id] += 1
-            i += 1
-            if i % report_frequency == 0:
-                print('Processed {} lines'.format(i))
-
 
 def get_kraken2_report_content(tax_reads, taxonomy_tree, total_reads):
     """
@@ -466,7 +450,7 @@ def make_kraken2_report(tax_reads, taxonomy_tree, total_reads, output_report):
 
     # If the output should go to file
     if output_report:
-        with open(output_report, 'w') as f:
+        with zopen(output_report, 'w') as f:
             for node in report_node_list:
 
                 # Format the output
@@ -644,27 +628,6 @@ def main_loop(f_handle, tax_reads_dict, taxonomy_tree, args, report_frequency, t
     # Output a report file
     make_kraken2_report(tax_reads_dict, taxonomy_tree, i, args.output_report)  # i is used to calculate the ratio of classified reads (col 1 in output file).
 
-
-def read_file(filename):
-    """
-    Wrapper to read either gzipped or ordinary text file input.
-    """
-    if filename.endswith('.gz'):
-        return gzip.open(filename, 'rt')
-    else:
-        return open(filename, 'r')
-
-
-def write_file(filename, gz_output):
-    """
-    Wrapper to write either gzipped or ordinary text file output.
-    """
-    if gz_output:
-        return gzip.open(filename, 'wt')
-    else:
-        return open(filename, 'w')
-
-
 def get_arguments():
     """
     Wrapper fnc to get the command line arguments. Inserting this piece of code
@@ -765,7 +728,7 @@ def stringmeup():
     v = None
 
     # Open the classifications input file:
-    with read_file(args.original_classifications_file) as f:
+    with zopen(args.original_classifications_file) as f:
         log.info('Processing read classifications from "{file}".'.format(file=path.abspath(args.original_classifications_file)))
 
         # TODO: make sure output files are writable
@@ -775,7 +738,7 @@ def stringmeup():
                 if not args.output_classifications.endswith('.gz'):
                     args.output_classifications += '.gz'
             log.info('Saving reclassified reads in {}.'.format(args.output_classifications))
-            o = write_file(args.output_classifications, args.gz_output)
+            o = zopen(args.output_classifications, args.gz_output)
 
         # If user wants to save the verbose classification output to file, open file
         if args.output_verbose:
@@ -783,7 +746,7 @@ def stringmeup():
                 if not args.output_verbose.endswith('.gz'):
                     args.output_verbose += '.gz'
             log.info('Saving verbose classification information in {}.'.format(args.output_verbose))
-            v = write_file(args.output_verbose, args.gz_output)
+            v = zopen(args.output_verbose, args.gz_output)
 
         # Run the main loop (reclassification)
         main_loop(f, tax_reads_dict, taxonomy_tree, args, report_frequency, taxa_lineages, verbose_input, o, v)
